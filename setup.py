@@ -24,9 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'packet_xorer = packet_xorer.packet_xorer:main'
+            'packet_xorer = packet_xorer.packet_xorer:main',
             'packet_xorer_robosense = packet_xorer.packet_xorer_robosense:main',
-            'packet_xorer_ouster = packet_xorer.packet_xorer_ouster:
+            'packet_xorer_ouster = packet_xorer.packet_xorer_ouster:main',
         ],
     },
 )
