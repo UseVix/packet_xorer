@@ -4,26 +4,40 @@ from rslidar_msg.msg import RslidarPacket
 from std_srvs.srv import Trigger
 from functools import partial
 import numpy as np
+from collections import deque
 
 class PacketSubscriber(Node): 
   def __init__(self):
     super().__init__('packet_xorer')
-    self.original_subscriber = self.create_subscription(RslidarPacket, '/rslidar_packets', partial(self.listener_callback, boolean_index=0), 10)
-    self.decompressed_subscriber = self.create_subscription(RslidarPacket, '/lidar_packets_decompressed', partial(self.listener_callback, boolean_index=1), 10)
-    self.original_msg = np.array([], dtype=np.uint8)
-    self.decompressed_msg = np.array([], dtype=np.uint8)
-    self.received_msg = [False, False]
+    self.original_subscriber = self.create_subscription(RslidarPacket, '/lidar_packets', partial(self.listener_callback, boolean_index=0), 1000)
+    self.decompressed_subscriber = self.create_subscription(RslidarPacket, '/lidar_packets_decompressed', partial(self.listener_callback, boolean_index=1), 1000)
+    self.original_msgs = deque()
+    self.decompressed_msgs = deque()
     self.count = 0
     self.non1080sizedpackets = 0
     self.erroringmessages = []
     self.republisher = self.create_publisher(RslidarPacket, '/lidar_packets', 10)
     self.republish_srv = self.create_service(Trigger, 'republish_erroring', self.republish_callback)
+    self.MSOP_counter = 0
+    self.DIFOP_counter = 0
+    self.unknown_counter = 0
     
   def listener_callback(self, msg, boolean_index):
     # Save the message depending on the topic
-    arr = np.asarray([element for packet in msg.packets for element in packet.data], dtype=np.uint8)
+    arr = np.asarray([element for element in msg.data], dtype=np.uint8)
     if boolean_index == 0:
-      self.original_msg = np.concatenate((self.original_msg, arr))
+      if np.array_equal(arr[:4], [0x55, 0xAA, 0x05, 0x5A]):
+        self.original_msgs.append(arr)
+        self.MSOP_counter += 1
+      elif np.array_equal(arr[:8], [0xA5, 0xFF, 0x00, 0x5A, 0x11, 0x11, 0x55, 0x55]):
+        self.DIFOP_counter += 1
+        print("DIFOP")
+        print("Counters: MSOP: {}, DIFOP: {}, Unknown: {}".format(self.MSOP_counter, self.DIFOP_counter, self.unknown_counter))
+      else:
+        self.unknown_counter += 1
+        print("Unknown packet type")
+        print("Counters: MSOP: {}, DIFOP: {}, Unknown: {}".format(self.MSOP_counter, self.DIFOP_counter, self.unknown_counter))
+        print(arr[:8].tolist())
       """
       for packet in msg.packets:
         if len(packet.data) != 1080:
@@ -35,29 +49,32 @@ class PacketSubscriber(Node):
 
       
     else:
-      self.decompressed_msg = np.concatenate((self.decompressed_msg, arr))
+      self.decompressed_msgs.append(arr)
       
-    self.received_msg[boolean_index] = True
     
     # When both have been received, do the bitwise XOR comparison
-    if self.received_msg[0] and self.received_msg[1] and len(self.original_msg) == len(self.decompressed_msg):
+    if self.original_msgs and self.decompressed_msgs:
+      original_msg = self.original_msgs.popleft()
+      decompressed_msg = self.decompressed_msgs.popleft()
+
+      if len(original_msg) != len(decompressed_msg):
+        print(f"Cannot XOR messages with different sizes: {len(original_msg)} and {len(decompressed_msg)}")
+        return
+
       # Vectorized XOR
-      xor_result = np.bitwise_xor(self.original_msg, self.decompressed_msg)
+      xor_result = np.bitwise_xor(original_msg, decompressed_msg)
       
       # Vectorized bit-counting (unpackbits turns bytes into an array of 0s and 1s, which we can just sum)
       diff_count = np.sum(np.unpackbits(xor_result))
-      print(f"Reserved bits: "+str(np.unpackbits(self.original_msg[-4:])))
+      #print(f"Reserved bits: "+str(np.unpackbits(original_msg[-4:])))
       # Expected bit differences from reserved bytes: 1 unencoded byte per point × 8 bits
       #expected_threshold = int(len(self.original_msg) / 1080 * 256 * 8)
       #comparison = "equal to" if diff_count == expected_threshold else ("below" if diff_count < expected_threshold else "above")
       #if comparison == "above":
       #  self.count += 1
-      print(f"Received both messages, after xoring detected {diff_count} bit differences")
-      print()
+      print(f"Received both messages, after xoring detected {diff_count} bit differences in {len(original_msg)*8} bit long messages that is {diff_count/(len(original_msg)*8)*100:.2f}% different")
+      
       #print(f"Total incorrect packets: {self.count}")
-      self.original_msg = np.array([], dtype=np.uint8)
-      self.decompressed_msg = np.array([], dtype=np.uint8)
-      self.received_msg=[False,False]
 
   def republish_callback(self, request, response):
     count = len(self.erroringmessages)

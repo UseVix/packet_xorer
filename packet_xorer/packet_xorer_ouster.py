@@ -4,26 +4,79 @@ from ouster_sensor_msgs.msg import PacketMsg
 from std_srvs.srv import Trigger
 from functools import partial
 import numpy as np
+from collections import deque
+import numpy as np
 
+def print_reserved_bits(packet_data):
+    # Define the little-endian structure of the 24,896-byte OS-128 packet
+    channel_block_dtype = np.dtype([
+        ('word0', '<u4'),
+        ('word1', '<u4'),
+        ('word2', '<u4')
+    ])
+
+    measurement_block_dtype = np.dtype([
+        ('header', '<u4', 4),
+        ('channels', channel_block_dtype, 128),
+        ('status', '<u4', 1)
+    ])
+
+    packet_dtype = np.dtype([
+        ('blocks', measurement_block_dtype, 16)
+    ])
+
+    # Parse the packet
+    packet = np.frombuffer(packet_data, dtype=packet_dtype)
+    blocks = packet['blocks'][0]
+    
+    # Extract and print the reserved bits
+    for block_idx in range(16):
+        print(f"\n--- Measurement Block {block_idx} ---")
+        
+        # Header Reserved Bits (Word 3, bits 24-31)
+        header_word3 = blocks['header'][block_idx, 3]
+        header_res = (header_word3 >> 24) & 0xFF
+        print(f"Header Reserved: {header_res:08b}")
+        
+        # Extract arrays for all 128 channels in this block
+        w0 = blocks['channels']['word0'][block_idx]
+        w1 = blocks['channels']['word1'][block_idx]
+        w2 = blocks['channels']['word2'][block_idx]
+        
+        # Mask out the reserved bits for all channels simultaneously
+        ch_res_20_27 = (w0 >> 20) & 0xFF
+        ch_res_29_31 = (w0 >> 29) & 0x07
+        ch_res_40_47 = (w1 >> 8) & 0xFF   
+        ch_res_80_95 = (w2 >> 16) & 0xFFFF 
+        
+        # Print the channels up to range(16)
+        for ch_idx in range(16): 
+            print(f"  Channel {ch_idx}:")
+            print(f"    Bits 20-27: {ch_res_20_27[ch_idx]:08b}")
+            print(f"    Bits 29-31: {ch_res_29_31[ch_idx]:03b}")
+            print(f"    Bits 40-47: {ch_res_40_47[ch_idx]:08b}")
+            print(f"    Bits 80-95: {ch_res_80_95[ch_idx]:016b}")
+
+# Example usage:
+# print_reserved_bits(original_msg)
 class PacketSubscriber(Node): 
   def __init__(self):
     super().__init__('packet_xorer')
-    self.original_subscriber = self.create_subscription(PacketMsg, '/os_node/lidar_packets', partial(self.listener_callback, boolean_index=0), 10)
-    self.decompressed_subscriber = self.create_subscription(PacketMsg, '/os_node/lidar_packets_decompressed', partial(self.listener_callback, boolean_index=1), 10)
-    self.original_msg = np.array([], dtype=np.uint8)
-    self.decompressed_msg = np.array([], dtype=np.uint8)
-    self.received_msg = [False, False]
+    self.original_subscriber = self.create_subscription(PacketMsg, '/lidar_packets', partial(self.listener_callback, boolean_index=0), 10)
+    self.decompressed_subscriber = self.create_subscription(PacketMsg, '/lidar_packets_decompressed', partial(self.listener_callback, boolean_index=1), 10)
+    self.original_msgs = deque()
+    self.decompressed_msgs = deque()
     self.count = 0
     self.non1080sizedpackets = 0
     self.erroringmessages = []
-    self.republisher = self.create_publisher(PacketMsg, '/os_node/lidar_packets', 10)
+    self.republisher = self.create_publisher(PacketMsg, '/lidar_packets', 10)
     self.republish_srv = self.create_service(Trigger, 'republish_erroring', self.republish_callback)
     
   def listener_callback(self, msg, boolean_index):
     # Save the message depending on the topic
-    arr = np.asarray([element for packet in msg.packets for element in packet.data], dtype=np.uint8)
+    arr = np.asarray([element for element in msg.buf], dtype=np.uint8)
     if boolean_index == 0:
-      self.original_msg = np.concatenate((self.original_msg, arr))
+      self.original_msgs.append(arr[:-1])  # Exclude the last byte for original messages
       """
       for packet in msg.packets:
         if len(packet.data) != 1080:
@@ -35,29 +88,32 @@ class PacketSubscriber(Node):
 
       
     else:
-      self.decompressed_msg = np.concatenate((self.decompressed_msg, arr))
-      
-    self.received_msg[boolean_index] = True
+      self.decompressed_msgs.append(arr) 
     
     # When both have been received, do the bitwise XOR comparison
-    if self.received_msg[0] and self.received_msg[1] and len(self.original_msg) == len(self.decompressed_msg):
+    if self.original_msgs and self.decompressed_msgs:
+      original_msg = self.original_msgs.popleft()
+      decompressed_msg = self.decompressed_msgs.popleft()
+
+      if len(original_msg) != len(decompressed_msg):
+        print(f"Cannot XOR messages with different sizes: {len(original_msg)} and {len(decompressed_msg)}")
+        return
+
       # Vectorized XOR
-      xor_result = np.bitwise_xor(self.original_msg, self.decompressed_msg)
+      xor_result = np.bitwise_xor(original_msg, decompressed_msg)
       
       # Vectorized bit-counting (unpackbits turns bytes into an array of 0s and 1s, which we can just sum)
       diff_count = np.sum(np.unpackbits(xor_result))
       
       # Expected bit differences from reserved bytes: 1 unencoded byte per point × 8 bits
-      #expected_threshold = int(len(self.original_msg) / 1080 * 256 * 8)
-      #comparison = "equal to" if diff_count == expected_threshold else ("below" if diff_count < expected_threshold else "above")
-      #if comparison == "above":
-      #  self.count += 1
+      expected_threshold = 4488
+      comparison = "equal to" if diff_count == expected_threshold else ("below" if diff_count < expected_threshold else "above")
+      if comparison == "above":
+        self.count += 1
       print(f"Received both messages, after xoring detected {diff_count} bit differences")
-      print(f"Reserved bits: "+str(np.unpackbits(self.original_msg)[120:128])+" "+str(np.unpackbits(self.original_msg)[128+80:128+96]))
-      #print(f"Total incorrect packets: {self.count}")
-      self.original_msg = np.array([], dtype=np.uint8)
-      self.decompressed_msg = np.array([], dtype=np.uint8)
-      self.received_msg=[False,False]
+      #print(f"Reserved bits: "+str(np.unpackbits(original_msg)[120:128])+" "+str(np.unpackbits(original_msg)[128+80:128+96]))
+      #print_reserved_bits(original_msg)
+      print(f"Total incorrect packets: {self.count}")
 
   def republish_callback(self, request, response):
     count = len(self.erroringmessages)
